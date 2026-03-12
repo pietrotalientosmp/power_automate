@@ -1,10 +1,11 @@
 """
-Flask endpoint — estrae, normalizza e filtra articoli RSS.
-Supporta sia il formato flat Power Automate (chiavi "0.title", "1.summary" …)
-sia il formato diretto (oggetti con campi title, summary, primaryLink, …).
+Flask endpoint — estrae, normalizza, filtra e fa scraping del testo completo
+di ogni articolo a partire dal suo URL.
+
+Dipendenze:
+  pip install flask gunicorn requests beautifulsoup4 lxml
 
 Avvio locale:
-  pip install flask
   python app.py
 
 Endpoint: POST http://localhost:5000/extract-articles
@@ -12,18 +13,51 @@ Endpoint: POST http://localhost:5000/extract-articles
 from flask import Flask, request, jsonify
 import re
 import logging
+import requests
+from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
-
 
 # ──────────────────────────────────────────────
 # COSTANTI
 # ──────────────────────────────────────────────
 
-WEEK_DAYS = 7          # finestra temporale per il filtro
-MIN_SCORE = 0.0        # abbassa a 0 per non perdere articoli validi
+WEEK_DAYS        = 7       # finestra temporale
+SCRAPE_TIMEOUT   = 10      # secondi per ogni richiesta HTTP
+MAX_WORKERS      = 6       # thread paralleli per lo scraping
+MAX_TEXT_WORDS   = 1200    # tronca il testo estratto oltre questa soglia
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+# Selettori CSS per trovare il contenuto principale (in ordine di priorità)
+CONTENT_SELECTORS = [
+    "article",
+    '[role="main"]',
+    "main",
+    ".post-content",
+    ".article-body",
+    ".entry-content",
+    ".content-body",
+    "#content",
+    ".story-body",
+]
+
+# Tag da rimuovere prima dell'estrazione (rumore)
+NOISE_TAGS = [
+    "script", "style", "noscript", "nav", "header", "footer",
+    "aside", "form", "button", "iframe", "figure", "figcaption",
+    "svg", "img", "picture", "video", "audio",
+]
 
 
 # ──────────────────────────────────────────────
@@ -31,11 +65,8 @@ MIN_SCORE = 0.0        # abbassa a 0 per non perdere articoli validi
 # ──────────────────────────────────────────────
 
 def _clean_text(text: str) -> str:
-    """Rimuove tag HTML, entities e spazi multipli."""
-    # Rimuove <img …> e tutti gli altri tag
     text = re.sub(r"<img[^>]*>", "", text, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]+>", "", text)
-    # HTML entities comuni
     entities = {
         "&#8230;": "…", "&amp;": "&", "&nbsp;": " ", "&#160;": " ",
         "&#8217;": "'", "&quot;": '"', "&lt;": "<", "&gt;": ">",
@@ -43,12 +74,76 @@ def _clean_text(text: str) -> str:
     }
     for ent, char in entities.items():
         text = text.replace(ent, char)
-    # Spazi multipli / newline
     text = re.sub(r"\s+", " ", text).strip()
-    # Rimuove il trailing "…" residuo se è tutto il summary
-    if text == "…":
-        text = ""
-    return text
+    return text if text != "…" else ""
+
+
+# ──────────────────────────────────────────────
+# SCRAPING TESTO COMPLETO ARTICOLO
+# ──────────────────────────────────────────────
+
+def scrape_article_text(url: str) -> dict:
+    """
+    Visita l'URL, estrae il testo pulito dell'articolo e restituisce:
+      {
+        "fullText":     "testo completo pulito",
+        "wordCount":    N,
+        "scrapeStatus": "ok" | "error" | "empty",
+        "scrapeError":  "msg"   # solo in caso di errore
+      }
+    """
+    if not url or not url.startswith("http"):
+        return {"fullText": "", "wordCount": 0, "scrapeStatus": "error", "scrapeError": "URL non valido"}
+
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=SCRAPE_TIMEOUT, allow_redirects=True)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        logging.warning(f"Scrape failed [{url}]: {e}")
+        return {"fullText": "", "wordCount": 0, "scrapeStatus": "error", "scrapeError": str(e)}
+
+    soup = BeautifulSoup(resp.text, "lxml")
+
+    # Rimuovi tag rumorosi
+    for tag in soup.find_all(NOISE_TAGS):
+        tag.decompose()
+
+    # Cerca il contenitore principale dell'articolo
+    content_node = None
+    for selector in CONTENT_SELECTORS:
+        content_node = soup.select_one(selector)
+        if content_node:
+            break
+
+    # Fallback al body intero
+    if not content_node:
+        content_node = soup.find("body") or soup
+
+    # Estrai paragrafi significativi
+    paragraphs = content_node.find_all(["p", "h1", "h2", "h3", "h4", "li"])
+    lines = []
+    for p in paragraphs:
+        line = p.get_text(separator=" ", strip=True)
+        line = re.sub(r"\s+", " ", line).strip()
+        if len(line) > 40:   # scarta righe troppo corte (menu, label, ecc.)
+            lines.append(line)
+
+    full_text = "\n\n".join(lines)
+
+    # Tronca se troppo lungo
+    words = full_text.split()
+    if len(words) > MAX_TEXT_WORDS:
+        full_text = " ".join(words[:MAX_TEXT_WORDS]) + " […]"
+        words = words[:MAX_TEXT_WORDS]
+
+    if not full_text.strip():
+        return {"fullText": "", "wordCount": 0, "scrapeStatus": "empty"}
+
+    return {
+        "fullText":     full_text,
+        "wordCount":    len(words),
+        "scrapeStatus": "ok",
+    }
 
 
 # ──────────────────────────────────────────────
@@ -56,7 +151,6 @@ def _clean_text(text: str) -> str:
 # ──────────────────────────────────────────────
 
 def _parse_date(date_str: str) -> str:
-    """Restituisce YYYY-MM-DD oppure stringa vuota."""
     if not date_str or date_str.startswith("0001"):
         return ""
     try:
@@ -66,8 +160,7 @@ def _parse_date(date_str: str) -> str:
         return date_str[:10] if len(date_str) >= 10 else date_str
 
 
-def _parse_date_obj(date_str: str) -> datetime | None:
-    """Restituisce oggetto datetime (UTC) o None."""
+def _parse_date_obj(date_str: str):
     if not date_str or date_str.startswith("0001"):
         return None
     try:
@@ -77,32 +170,27 @@ def _parse_date_obj(date_str: str) -> datetime | None:
 
 
 def _is_within_last_week(date_str: str) -> bool:
-    """True se la data cade negli ultimi WEEK_DAYS giorni."""
     dt = _parse_date_obj(date_str)
     if dt is None:
-        return False  # data assente → escludi
+        return False
     cutoff = datetime.now(timezone.utc) - timedelta(days=WEEK_DAYS)
     return dt >= cutoff
 
 
 # ──────────────────────────────────────────────
-# NORMALIZZAZIONE ARTICOLO SINGOLO
+# NORMALIZZAZIONE SINGOLO ARTICOLO
 # ──────────────────────────────────────────────
 
 def _normalize_single(item: dict) -> dict:
     title   = _clean_text(str(item.get("title", "")))
     summary = _clean_text(str(item.get("summary", "")))
-
-    # URL: primaryLink > links[0] > id
-    url = str(
+    url     = str(
         item.get("primaryLink")
         or (item.get("links", [None])[0] if isinstance(item.get("links"), list) else None)
         or item.get("id", "")
     ).strip()
-
     publish_date = _parse_date(str(item.get("publishDate", "")))
 
-    # Categorie: lista oppure stringa
     categories = item.get("categories", [])
     if isinstance(categories, str):
         categories = [c.strip() for c in categories.split(",") if c.strip()]
@@ -118,26 +206,19 @@ def _normalize_single(item: dict) -> dict:
         "summary":     summary,
         "publishDate": publish_date,
         "categories":  categories,
-        "wordCount":   len(summary.split()) if summary else 0,
     }
 
 
 # ──────────────────────────────────────────────
-# FORMATO FLAT (Power Automate foreachItems)
+# FORMATO FLAT POWER AUTOMATE
 # ──────────────────────────────────────────────
 
 def _is_flat_format(items: list) -> bool:
-    """Verifica se il primo elemento usa chiavi tipo "0.title"."""
-    return (
-        items
-        and isinstance(items[0], dict)
-        and any("." in k for k in items[0])
-    )
+    return items and isinstance(items[0], dict) and any("." in k for k in items[0])
 
 
 def _parse_flat_format(flat_list: list) -> list:
-    articles_map: dict[int, dict] = {}
-
+    articles_map: dict = {}
     for flat_dict in flat_list:
         for key, value in flat_dict.items():
             parts = key.split(".", 1)
@@ -150,7 +231,6 @@ def _parse_flat_format(flat_list: list) -> list:
             field = parts[1]
             if idx not in articles_map:
                 articles_map[idx] = {}
-
             if "." in field:
                 sub_key = field.split(".", 1)[0]
                 if sub_key not in articles_map[idx]:
@@ -158,7 +238,6 @@ def _parse_flat_format(flat_list: list) -> list:
                 articles_map[idx][sub_key].append(value)
             else:
                 articles_map[idx][field] = value
-
     return [_normalize_single(articles_map[i]) for i in sorted(articles_map.keys())]
 
 
@@ -174,11 +253,9 @@ def normalize_articles(raw_items: list) -> list:
 
 def score_article(article: dict) -> float:
     score = 0.0
+    wc = article.get("fullTextWordCount", 0)
+    score += min(wc / 50, 10)   # fino a 10 punti per testo ricco
 
-    # Più parole nel summary → articolo più ricco
-    score += min(article["wordCount"] / 10, 10)
-
-    # Recency: -0.5 punti per ogni giorno di vecchiaia (max bonus 10)
     if article["publishDate"]:
         try:
             pub = datetime.strptime(article["publishDate"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -187,9 +264,11 @@ def score_article(article: dict) -> float:
         except Exception:
             pass
 
-    # Penalità articoli sponsorizzati
     if "sponsored" in [c.lower() for c in article.get("categories", [])]:
         score -= 5
+
+    if article.get("scrapeStatus") != "ok":
+        score -= 3
 
     return round(score, 2)
 
@@ -201,31 +280,33 @@ def score_article(article: dict) -> float:
 @app.route("/extract-articles", methods=["POST"])
 def extract_articles():
     """
-    Accetta due formati di body JSON:
+    Input (accetta sia foreachItems sia items):
+    { "foreachItems": [ { "title": "…", "primaryLink": "…", "publishDate": "…", … } ] }
 
-    1) Formato diretto (Google Blog / RSS generico):
+    Output:
     {
-      "foreachItems": [ { "title": "…", "summary": "…", "primaryLink": "…", … } ]
-    }
-
-    2) Formato flat Power Automate:
-    {
-      "items": [ { "0.title": "…", "0.summary": "…", … } ]
-    }
-
-    Risposta:
-    {
-      "articles": [ { title, url, summary, publishDate, categories, wordCount, score } ],
-      "count": N,
-      "filtered": M,          ← articoli scartati perché fuori dalla settimana
-      "processedAt": "…"
+      "articles": [
+        {
+          "title":              "…",
+          "url":                "https://…",
+          "summary":            "…breve dal feed RSS…",
+          "fullText":           "…testo completo estratto dalla pagina…",
+          "fullTextWordCount":  N,
+          "scrapeStatus":       "ok" | "error" | "empty",
+          "publishDate":        "YYYY-MM-DD",
+          "categories":         […],
+          "score":              9.5
+        }
+      ],
+      "count":       N,
+      "filtered":    M,
+      "processedAt": "2026-03-12T10:00:00Z"
     }
     """
     body = request.get_json(silent=True)
     if not body:
         return jsonify({"error": "Body JSON non valido o mancante"}), 400
 
-    # Accetta sia "items" sia "foreachItems" come chiave radice
     raw_items = body.get("foreachItems") or body.get("items", [])
     if not raw_items:
         return jsonify({"error": "Campo 'items' / 'foreachItems' mancante o vuoto"}), 400
@@ -233,37 +314,57 @@ def extract_articles():
     if not isinstance(raw_items, list):
         raw_items = [raw_items]
 
-    # Normalizza
+    # 1. Normalizza metadati dal feed
     all_articles = normalize_articles(raw_items)
     total_before = len(all_articles)
 
-    # ── Filtro ultima settimana ──
+    # 2. Filtro ultima settimana
     articles = [a for a in all_articles if _is_within_last_week(a["publishDate"])]
     filtered_out = total_before - len(articles)
+    logging.info(f"Articoli dopo filtro data: {len(articles)} / {total_before}")
 
-    # Scoring e ordinamento
-    for a in articles:
+    # 3. Scraping parallelo del testo completo per ogni articolo
+    def _scrape_and_merge(article: dict) -> dict:
+        result = scrape_article_text(article["url"])
+        article["fullText"]          = result.get("fullText", "")
+        article["fullTextWordCount"] = result.get("wordCount", 0)
+        article["scrapeStatus"]      = result.get("scrapeStatus", "error")
+        if "scrapeError" in result:
+            article["scrapeError"]   = result["scrapeError"]
+        return article
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(_scrape_and_merge, a): a for a in articles}
+        scraped = []
+        for future in as_completed(futures):
+            try:
+                scraped.append(future.result())
+            except Exception as e:
+                art = futures[future]
+                art.update({"fullText": "", "fullTextWordCount": 0,
+                             "scrapeStatus": "error", "scrapeError": str(e)})
+                scraped.append(art)
+
+    # 4. Scoring e ordinamento
+    for a in scraped:
         a["score"] = score_article(a)
-    articles.sort(key=lambda x: x["score"], reverse=True)
+    scraped.sort(key=lambda x: x["score"], reverse=True)
 
     return jsonify({
-        "articles":    articles,
-        "count":       len(articles),
+        "articles":    scraped,
+        "count":       len(scraped),
         "filtered":    filtered_out,
         "processedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     })
 
 
 # ──────────────────────────────────────────────
-# ENDPOINT DI DEBUG — nessun filtro temporale
+# ENDPOINT DEBUG — nessun filtro data
 # ──────────────────────────────────────────────
 
 @app.route("/extract-articles-all", methods=["POST"])
 def extract_articles_all():
-    """
-    Identico a /extract-articles ma SENZA filtro data.
-    Utile in fase di test per verificare la normalizzazione completa.
-    """
+    """Identico a /extract-articles ma senza filtro temporale. Per test."""
     body = request.get_json(silent=True)
     if not body:
         return jsonify({"error": "Body JSON non valido o mancante"}), 400
@@ -276,13 +377,32 @@ def extract_articles_all():
         raw_items = [raw_items]
 
     articles = normalize_articles(raw_items)
-    for a in articles:
+
+    def _scrape_and_merge(article):
+        result = scrape_article_text(article["url"])
+        article["fullText"]          = result.get("fullText", "")
+        article["fullTextWordCount"] = result.get("wordCount", 0)
+        article["scrapeStatus"]      = result.get("scrapeStatus", "error")
+        return article
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(_scrape_and_merge, a): a for a in articles}
+        scraped = []
+        for future in as_completed(futures):
+            try:
+                scraped.append(future.result())
+            except Exception as e:
+                art = futures[future]
+                art.update({"fullText": "", "fullTextWordCount": 0, "scrapeStatus": "error"})
+                scraped.append(art)
+
+    for a in scraped:
         a["score"] = score_article(a)
-    articles.sort(key=lambda x: x["score"], reverse=True)
+    scraped.sort(key=lambda x: x["score"], reverse=True)
 
     return jsonify({
-        "articles":    articles,
-        "count":       len(articles),
+        "articles":    scraped,
+        "count":       len(scraped),
         "processedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     })
 
