@@ -3,9 +3,14 @@
   "info": {
     "title": "Newsletter Article Extractor",
     "description": "Estrae, normalizza e punteggia articoli RSS per la newsletter settimanale.",
-    "version": "1.0"
+    "version": "1.0",
+    "x-ms-api-annotation": {
+      "status": "Preview",
+      "family": "NewsletterExtractor",
+      "revision": 1
+    }
   },
-  "host": "powerautomate-production.up.railway.app",
+  "host": "YOUR-APP-NAME.railway.app",
   "basePath": "/",
   "schemes": [
     "https"
@@ -152,5 +157,7 @@
         }
       }
     }
-  }
+  },
+  "securityDefinitions": {},
+  "security": []
 }
