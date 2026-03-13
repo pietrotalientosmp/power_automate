@@ -6,7 +6,6 @@
     "version": "1.0",
     "x-ms-api-annotation": {
       "status": "Preview",
-      "family": "NewsletterExtractor",
       "revision": 1
     }
   },
