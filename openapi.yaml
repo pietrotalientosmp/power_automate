@@ -16,10 +16,6 @@ paths:
   /extract-articles:
     post:
       summary: Estrai e normalizza articoli
-      description: >
-        Riceve il foreachItems di Power Automate (articoli RSS grezzi),
-        li normalizza, pulisce le HTML entities, calcola un punteggio
-        e li restituisce ordinati per rilevanza.
       operationId: ExtractArticles
       parameters:
         - in: body
@@ -34,8 +30,6 @@ paths:
             $ref: "#/definitions/ExtractResponse"
         400:
           description: Input non valido
-          schema:
-            $ref: "#/definitions/ErrorResponse"
 
   /health:
     get:
@@ -44,14 +38,34 @@ paths:
       responses:
         200:
           description: Servizio attivo
-          schema:
-            type: object
-            properties:
-              status:
-                type: string
-                example: ok
 
 definitions:
+  RSSArticle:
+    type: object
+    properties:
+      id:
+        type: string
+      title:
+        type: string
+      primaryLink:
+        type: string
+      links:
+        type: array
+        items:
+          type: string
+      publishDate:
+        type: string
+      updatedOn:
+        type: string
+      summary:
+        type: string
+      copyright:
+        type: string
+      categories:
+        type: array
+        items:
+          type: string
+
   ExtractRequest:
     type: object
     required:
@@ -59,48 +73,30 @@ definitions:
     properties:
       items:
         type: array
-        description: >
-          Lista di oggetti flat da Power Automate (foreachItems).
-          Le chiavi hanno formato "0.title", "1.summary", ecc.
+        description: Array di articoli RSS dal feed
         items:
-          type: object
-          additionalProperties:
-            type: string
+          $ref: "#/definitions/RSSArticle"
 
   Article:
     type: object
     properties:
       title:
         type: string
-        description: Titolo dell'articolo
-        example: "How Pokémon Go is helping robots deliver pizza on time"
       url:
         type: string
-        description: URL diretto all'articolo
-        example: "https://www.technologyreview.com/2026/03/10/..."
       summary:
         type: string
-        description: Sommario testuale pulito (senza HTML entities)
-        example: "Pokémon Go was the world's first augmented-reality megahit..."
       publishDate:
         type: string
-        description: Data di pubblicazione in formato YYYY-MM-DD
-        example: "2026-03-10"
       categories:
         type: array
         items:
           type: string
-        description: Categorie dell'articolo (filtrate)
-        example: ["Artificial intelligence"]
       wordCount:
         type: integer
-        description: Numero di parole nel summary
-        example: 32
       score:
         type: number
         format: float
-        description: Punteggio di rilevanza (più alto = più rilevante)
-        example: 9.5
 
   ExtractResponse:
     type: object
@@ -109,19 +105,7 @@ definitions:
         type: array
         items:
           $ref: "#/definitions/Article"
-        description: Articoli ordinati per score decrescente
       count:
         type: integer
-        description: Numero totale di articoli
-        example: 10
       processedAt:
         type: string
-        description: Timestamp di elaborazione ISO 8601
-        example: "2026-03-11T10:00:00Z"
-
-  ErrorResponse:
-    type: object
-    properties:
-      error:
-        type: string
-        example: "Campo 'items' mancante o vuoto"
