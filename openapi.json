@@ -10,7 +10,7 @@
       "revision": 1
     }
   },
-  "host": "YOUR-APP-NAME.railway.app",
+  "host": "powerautomate-production.up.railway.app",
   "basePath": "/",
   "schemes": [
     "https"
